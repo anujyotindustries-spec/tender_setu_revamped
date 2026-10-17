@@ -35,11 +35,15 @@ router.get('/', async (req: AuthenticatedRequest, res) => {
   const filterSql = filterClauses.length ? ` AND ${filterClauses.join(' AND ')}` : '';
 
   try {
+    // Closed tenders stay in the database but are not shown as live matches;
+    // otherwise they bury every newly fetched tender. Tenders with no parsed
+    // deadline are kept (they are flagged for manual review in the UI).
     let { rows } = await query(`
       SELECT m.*, row_to_json(t.*) as tender
       FROM matches m
       JOIN tenders t ON m.tender_id = t.id
-      WHERE m.company_id = $1 AND m.overall_score >= 30${filterSql}
+      WHERE m.company_id = $1 AND m.overall_score >= 30
+        AND (t.deadline IS NULL OR t.deadline > NOW())${filterSql}
       ORDER BY m.overall_score DESC
     `, filterValues);
 

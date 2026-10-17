@@ -28,9 +28,19 @@ exports.up = (pgm) => {
   pgm.sql('ALTER TABLE review_queue ADD COLUMN IF NOT EXISTS source TEXT;');
   pgm.sql('ALTER TABLE review_queue ADD COLUMN IF NOT EXISTS parsed_data JSONB;');
 
-  pgm.addConstraint('tenders', 'tenders_source_status_check', {
-    check: "source_status IN ('live_scraped', 'template_sample', 'verified', 'needs_review')",
-  });
+  // Guarded so the migration is safe to run against a database where these
+  // columns/constraints were already created before it was recorded.
+  pgm.sql(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'tenders_source_status_check'
+      ) THEN
+        ALTER TABLE tenders ADD CONSTRAINT tenders_source_status_check
+          CHECK (source_status IN ('live_scraped', 'template_sample', 'verified', 'needs_review'));
+      END IF;
+    END $$;
+  `);
   pgm.createIndex('tenders', ['source_status', 'deadline'], { ifNotExists: true });
   pgm.createIndex('company_users', ['company_id'], { ifNotExists: true });
 };

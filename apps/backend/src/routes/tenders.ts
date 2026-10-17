@@ -108,16 +108,28 @@ function unavailableAnswer(needsManualReview: boolean, answer: string): TenderAn
   return { answer_available: false, answer_kind: 'unavailable', answer, citations: [], needs_manual_review: needsManualReview };
 }
 
-// POST /api/tenders/sync - Kick off a live scrape of 24 government portals in
-// the background. A full run takes minutes (sequential requests to real
-// external sites), far longer than any serverless request can stay open, so
-// we return immediately and let it finish via Vercel's waitUntil instead of
-// blocking the response on it.
+// POST /api/tenders/sync - Pull the newest tenders from the CPPP and GeM
+// listings and wait for the result, so the dashboard reloads *after* the new
+// tenders are stored. This is a quick run (first few pages, 40s budget) that
+// fits in the serverless time limit; the exhaustive crawl is the scheduled
+// GitHub Actions job.
 router.post('/sync', requireAuth, syncLimiter, async (_req, res) => {
   try {
-    const { waitUntil } = await import('@vercel/functions');
-    waitUntil(runLiveScraper().catch((error) => console.error('Background sync failed:', error)));
-    return res.json({ started: true, message: 'Sync started. New tenders will appear within a few minutes.' });
+    const result = await runLiveScraper({ quick: true });
+    if (result.skipped) {
+      return res.json({ started: false, added: 0, message: 'A sync is already running. Try again in a minute.' });
+    }
+    if (result.failed) {
+      const reasons = result.sources.filter((s) => s.error).map((s) => `${s.name}: ${s.error}`).join('; ');
+      return res.status(502).json({ error: `Could not fetch live tenders. ${reasons}`.trim() });
+    }
+    return res.json({
+      started: true,
+      added: result.count,
+      message: result.count > 0
+        ? `Fetched ${result.count} new live tender${result.count === 1 ? '' : 's'}.`
+        : 'Already up to date: no new tenders have been published since the last sync.',
+    });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }

@@ -2,59 +2,81 @@
 import * as cheerio from 'cheerio';
 import { pool, query } from '../utils/db';
 import { scoreTenderAgainstCompanies } from './matchingService';
-import { extractTenderData } from './extractionService';
+import { extractTenderData, parseLocalTenderData } from './extractionService';
 import { getGeminiUsageStats } from './geminiService';
-import fs from 'fs';
 
 const SCRAPER_ADVISORY_LOCK = 82507421;
 
-// ─── Portal registry ────────────────────────────────────────────────────────
-// Each entry describes one government portal to crawl.
-// method: 'static'  → Axios + Cheerio (no browser, works on Vercel-style hosts)
-// method: 'dynamic' → Puppeteer headless Chrome (for JS-rendered pages)
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// ─── Listing sources (primary) ──────────────────────────────────────────────
+// The Central Public Procurement Portal and its GeM mirror publish every
+// active central/state tender as a server-rendered, newest-first table, so a
+// plain HTTP fetch is enough: no headless browser, and closing dates come
+// straight from the table instead of being guessed from free text.
+
+interface ListingSource {
+  name: string;
+  pageUrl: (page: number) => string;
+}
+
+const CPPP_BASE = 'https://eprocure.gov.in/cppp/latestactivetendersnew/cpppdata';
+
+const LISTING_SOURCES: ListingSource[] = [
+  {
+    name: 'eProcure CPPP',
+    // CPPP only paginates through a base64-encoded `url` parameter.
+    pageUrl: (page) =>
+      page === 1
+        ? CPPP_BASE
+        : `${CPPP_BASE}?url=${encodeURIComponent(Buffer.from(`${CPPP_BASE}?page=${page}`).toString('base64'))}`,
+  },
+  {
+    name: 'GeM CPPP',
+    pageUrl: (page) => (page === 1 ? 'https://gem.gov.in/cppp' : `https://gem.gov.in/cppp/${page}`),
+  },
+];
+
+const FULL_RUN_MAX_PAGES = 100;   // ~1,000 tenders per source per scheduled run
+const QUICK_RUN_MAX_PAGES = 3;    // manual "Refresh" from the dashboard
+const QUICK_RUN_BUDGET_MS = 40_000; // must fit inside the 60s serverless limit
+const KNOWN_PAGES_BEFORE_STOP = 2; // listings are newest-first, so stop once we reach tenders we already hold
+const MAX_CONSECUTIVE_INSERT_ERRORS = 5;
+
+// ─── Secondary portals (static HTML) ────────────────────────────────────────
+// Only portals verified on 2026-10-17 to return real tender rows over plain
+// HTTP are listed. The previous registry also held ~20 portals that 404, sit
+// behind a captcha/JS search form (all NIC GePNIC state portals), or return
+// bot-block and nav-menu text that was being ingested as "tenders".
 
 interface PortalConfig {
   name: string;
   url: string;
-  method: 'static' | 'dynamic';
-  rowSelector?: string;      // CSS selector for table rows or list items
-  maxItems?: number;         // maximum tenders to ingest per run
+  rowSelector: string;
+  maxItems: number;
 }
 
 const PORTAL_REGISTRY: PortalConfig[] = [
-  // ── Central Government ──────────────────────────────────────────────────
-  { name: 'GeM CPPP',       url: 'https://gem.gov.in/cppp',                                  method: 'dynamic', maxItems: 100 },
-  { name: 'eProcure CPPP',  url: 'https://eprocure.gov.in/eprocure/app?component=%24DirectLink&page=FrontEndTendersByOrganisation&service=direct&session=T&sp=SXRyU3QxeGxGcHZFS1BZb1JiMFE9PQ%3D%3D', method: 'static',  rowSelector: 'table tr', maxItems: 80 },
-  { name: 'DRDO',           url: 'https://www.drdo.gov.in/tender',                            method: 'static',  rowSelector: 'table tr, .tender-item, li a', maxItems: 50 },
-  { name: 'NHAI',           url: 'https://www.nhai.gov.in/tender-notice',                     method: 'static',  rowSelector: 'table tr, .views-row', maxItems: 50 },
-  { name: 'CPWD',           url: 'https://cpwd.gov.in/Publication/TenderAwards.aspx',         method: 'static',  rowSelector: 'table tr', maxItems: 50 },
-  { name: 'MeitY',          url: 'https://www.meity.gov.in/tenders',                          method: 'static',  rowSelector: 'table tr, .views-row', maxItems: 40 },
-  { name: 'NICSI',          url: 'https://www.nicsi.nic.in/nicsi/tender.php',                 method: 'static',  rowSelector: 'table tr', maxItems: 30 },
-  { name: 'IREPS Railways', url: 'https://www.ireps.gov.in/ireps/tnd/viewTender.action',      method: 'static',  rowSelector: 'table tr', maxItems: 60 },
-
-  // ── PSU Portals ─────────────────────────────────────────────────────────
-  { name: 'NTPC',           url: 'https://ntpctender.ntpc.co.in/APT/tenderSearch.aspx',       method: 'static',  rowSelector: 'table tr', maxItems: 40 },
-  { name: 'BHEL',           url: 'https://tenders.bhel.com/BhelTenders/viewtenders.aspx',     method: 'static',  rowSelector: 'table tr', maxItems: 40 },
-  { name: 'SAIL',           url: 'https://www.sailtenders.co.in/MainPage.aspx',               method: 'static',  rowSelector: 'table tr', maxItems: 40 },
-  { name: 'HAL',            url: 'https://hal-india.co.in/Tender/tenderdetail',               method: 'static',  rowSelector: 'table tr, li a, .tender', maxItems: 30 },
-  { name: 'BPCL',           url: 'https://www.bharatpetroleum.in/tender/activetenderdetails.aspx', method: 'static', rowSelector: 'table tr', maxItems: 30 },
-  { name: 'ONGC',           url: 'https://www.ongcindia.com/web/ind/tender',                  method: 'static',  rowSelector: 'table tr, .tender-row', maxItems: 30 },
-  { name: 'Coal India',     url: 'https://www.coalindia.in/en-us/company/tenders.aspx',       method: 'static',  rowSelector: 'table tr', maxItems: 30 },
-
-  // ── Education & Research ────────────────────────────────────────────────
-  { name: 'AIIMS Delhi',    url: 'https://www.aiims.edu/index.php/en/tenders/aiims-tender',   method: 'static',  rowSelector: 'table tr', maxItems: 40 },
-  { name: 'IIT Delhi',      url: 'https://home.iitd.ac.in/tenders.php',                       method: 'static',  rowSelector: 'a[href*="/tenders/"]', maxItems: 30 },
-  { name: 'IIT Bombay',     url: 'https://www.iitb.ac.in/newacadhome/tenders.jsp',            method: 'static',  rowSelector: 'table tr, li a', maxItems: 30 },
-  { name: 'IIT Madras',     url: 'https://www.iitm.ac.in/tenders',                            method: 'static',  rowSelector: 'table tr, li', maxItems: 30 },
-  { name: 'C-DAC',          url: 'https://www.cdac.in/index.aspx?id=tenders',                 method: 'static',  rowSelector: 'a[href*="tenders_details"]', maxItems: 30 },
-  { name: 'NIC',            url: 'https://www.nic.in/tenders/',                               method: 'static',  rowSelector: 'table tr, li a', maxItems: 20 },
-
-  // ── State Portals ────────────────────────────────────────────────────────
-  { name: 'Maharashtra Tenders', url: 'https://mahatenders.gov.in/nicgep/app?component=%24DirectLink&page=FrontEndTendersByOrganisation&service=direct&session=T', method: 'static', rowSelector: 'table tr', maxItems: 40 },
-  { name: 'Delhi Tenders',  url: 'https://govtprocurement.delhi.gov.in/nicgep/app?component=%24DirectLink&page=FrontEndTendersByOrganisation&service=direct&session=T', method: 'static', rowSelector: 'table tr', maxItems: 30 },
-  { name: 'Kerala Tenders', url: 'https://etenders.kerala.gov.in/nicgep/app?component=%24DirectLink&page=FrontEndTendersByOrganisation&service=direct&session=T', method: 'static', rowSelector: 'table tr', maxItems: 30 },
-  { name: 'Haryana Tenders',url: 'https://etenders.hry.nic.in/nicgep/app?component=%24DirectLink&page=FrontEndTendersByOrganisation&service=direct&session=T', method: 'static', rowSelector: 'table tr', maxItems: 30 },
+  { name: 'AIIMS Delhi', url: 'https://www.aiims.edu/index.php/en/tenders/aiims-tender', rowSelector: 'table tr',               maxItems: 40 },
+  { name: 'IIT Delhi',   url: 'https://home.iitd.ac.in/tenders.php',                     rowSelector: 'a[href*="/tenders/"]',   maxItems: 30 },
+  { name: 'C-DAC',       url: 'https://www.cdac.in/index.aspx?id=tenders',               rowSelector: 'a[href*="tenders_details"]', maxItems: 30 },
+  // Unreachable from the verification machine (connection reset); kept in case it was transient.
+  { name: 'HAL',         url: 'https://hal-india.co.in/Tender/tenderdetail',             rowSelector: 'table tr, li a, .tender', maxItems: 30 },
+  { name: 'IIT Bombay',  url: 'https://www.iitb.ac.in/newacadhome/tenders.jsp',          rowSelector: 'table tr, li a',         maxItems: 30 },
 ];
+
+export interface SourceResult {
+  name: string;
+  fetched: number;
+  added: number;
+  insertErrors: number;
+  error?: string;
+}
+
+export interface ScrapeOptions {
+  quick?: boolean;
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -84,121 +106,235 @@ async function ingestRawText(rawText: string, source: string, url?: string): Pro
   }
 }
 
-// ─── Static scraper (Axios + Cheerio) ────────────────────────────────────────
+async function fetchHtml(url: string, attempts = 3): Promise<string> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const { data } = await axios.get<string>(url, {
+        timeout: 25000,
+        headers: {
+          'User-Agent': USER_AGENT,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+        },
+      });
+      return data;
+    } catch (err: any) {
+      lastError = err;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+    }
+  }
+  throw lastError;
+}
 
-async function scrapeStaticPortal(portal: PortalConfig): Promise<number> {
-  const { name, url, rowSelector = 'table tr, li a, .tender-item', maxItems = 50 } = portal;
+// ─── Listing scraper (CPPP + GeM) ───────────────────────────────────────────
+
+interface ListedTender {
+  title: string;
+  organisation: string;
+  publishedAt: string;
+  closingAt: string;
+  url: string;
+}
+
+// Columns are located by header text, not position, because CPPP and its GeM
+// mirror order them differently.
+export function parseListingTable(html: string, pageUrl: string): ListedTender[] {
+  const $ = cheerio.load(html);
+  const listed: ListedTender[] = [];
+
+  $('table').each((_t, table) => {
+    const headers = $(table)
+      .find('thead th')
+      .map((_i, th) => $(th).text().replace(/\s+/g, ' ').trim().toLowerCase())
+      .get();
+    const titleCol = headers.findIndex((h) => h.startsWith('title'));
+    if (titleCol < 0) return;
+    const col = (pattern: RegExp) => headers.findIndex((h) => pattern.test(h));
+    const closingCol = col(/closing/);
+    const publishedCol = col(/published/);
+    const organisationCol = col(/organisation/);
+
+    $(table).find('tbody tr').each((_r, tr) => {
+      const cells = $(tr).children('td');
+      const text = (i: number) => (i >= 0 ? $(cells[i]).text().replace(/\s+/g, ' ').trim() : '');
+      const title = text(titleCol);
+      if (!title) return;
+      const href = $(cells[titleCol]).find('a').first().attr('href');
+      let url = pageUrl;
+      if (href) {
+        try { url = new URL(href, pageUrl).toString(); } catch { /* keep the listing URL */ }
+      }
+      listed.push({
+        title,
+        organisation: text(organisationCol),
+        publishedAt: text(publishedCol),
+        closingAt: text(closingCol),
+        url,
+      });
+    });
+  });
+
+  return listed;
+}
+
+async function findKnownTenders(rows: ListedTender[]): Promise<{ urls: Set<string>; titles: Set<string> }> {
+  const res = await query(
+    `SELECT url, LOWER(title) AS title FROM tenders WHERE url = ANY($1::text[]) OR LOWER(title) = ANY($2::text[])`,
+    [rows.map((r) => r.url), rows.map((r) => r.title.toLowerCase())],
+  );
+  return {
+    urls: new Set(res.rows.map((r: any) => r.url).filter(Boolean)),
+    titles: new Set(res.rows.map((r: any) => r.title)),
+  };
+}
+
+// Returns true when a tender was inserted. The title already carries the
+// tender reference/id, so an exact title or URL match is a true duplicate —
+// unlike the fuzzy prefix match used for free-text rows, which silently drops
+// distinct tenders that merely start with the same words.
+async function insertListedTender(row: ListedTender, source: string): Promise<boolean> {
+  const rawText = [
+    `Title & ID: ${row.title}`,
+    `Organisation: ${row.organisation}`,
+    `Closing Date: ${row.closingAt}`,
+    `Published Date: ${row.publishedAt}`,
+    `Portal URL: ${row.url}`,
+  ].join('\n');
+
+  // Classification only; the structured columns override the guessed fields.
+  const parsed = parseLocalTenderData(rawText.replace(/\nPortal URL:.*$/, ''), source);
+  const deadline = parsed.deadline;
+  if (deadline && new Date(deadline).getTime() < Date.now()) return false; // already closed
+
+  const inserted = await query(
+    `INSERT INTO tenders (title, source, sector, value, deadline, eligibility, certifications, personnel_requirements, state, district, authority_type, raw_text, confidence_score, url, source_status, needs_manual_review)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     RETURNING id`,
+    [
+      row.title, source, parsed.sector, parsed.value, deadline, parsed.eligibility, parsed.certifications,
+      parsed.personnel_requirements, parsed.state, parsed.district, parsed.authority_type, rawText,
+      parsed.confidence_score, row.url,
+      deadline ? 'live_scraped' : 'needs_review',
+      !deadline,
+    ],
+  );
+  await scoreTenderAgainstCompanies(inserted.rows[0].id).catch(console.error);
+  return true;
+}
+
+async function scrapeListingSource(source: ListingSource, maxPages: number, stopAt: number): Promise<SourceResult> {
+  const result: SourceResult = { name: source.name, fetched: 0, added: 0, insertErrors: 0 };
+  console.log(`\n[Listing] Scraping ${source.name}...`);
+
+  let knownPagesInARow = 0;
+  let consecutiveInsertErrors = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    if (Date.now() > stopAt) {
+      console.log(`[Listing] ${source.name}: time budget reached at page ${page}.`);
+      break;
+    }
+
+    let rows: ListedTender[];
+    try {
+      rows = parseListingTable(await fetchHtml(source.pageUrl(page)), source.pageUrl(page));
+    } catch (err: any) {
+      result.error = `page ${page}: ${err.message}`;
+      console.error(`[Listing] ❌ ${source.name} ${result.error}`);
+      break;
+    }
+    if (rows.length === 0) {
+      if (page === 1) {
+        result.error = 'page 1 returned no tender rows (blocked, or the page layout changed)';
+        console.error(`[Listing] ❌ ${source.name} ${result.error}`);
+      }
+      break;
+    }
+    result.fetched += rows.length;
+
+    const known = await findKnownTenders(rows);
+    const fresh = rows.filter((r) => !known.urls.has(r.url) && !known.titles.has(r.title.toLowerCase()));
+    console.log(`[Listing] ${source.name} page ${page}: ${rows.length} listed, ${fresh.length} new`);
+
+    knownPagesInARow = fresh.length === 0 ? knownPagesInARow + 1 : 0;
+
+    for (const row of fresh) {
+      try {
+        if (await insertListedTender(row, source.name)) result.added++;
+        consecutiveInsertErrors = 0;
+      } catch (err: any) {
+        result.insertErrors++;
+        consecutiveInsertErrors++;
+        console.error(`[Listing] Insert failed for "${row.title.substring(0, 60)}": ${err.message}`);
+        if (consecutiveInsertErrors >= MAX_CONSECUTIVE_INSERT_ERRORS) {
+          result.error = `aborted after ${MAX_CONSECUTIVE_INSERT_ERRORS} consecutive insert errors: ${err.message}`;
+          console.error(`[Listing] ❌ ${source.name} ${result.error}`);
+          return result;
+        }
+      }
+    }
+
+    if (knownPagesInARow >= KNOWN_PAGES_BEFORE_STOP) {
+      console.log(`[Listing] ${source.name}: reached tenders already stored, stopping.`);
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+
+  console.log(`[Listing] ${source.name}: +${result.added} new tenders (${result.fetched} scanned)`);
+  return result;
+}
+
+// ─── Static portal scraper (Axios + Cheerio) ────────────────────────────────
+
+async function scrapeStaticPortal(portal: PortalConfig): Promise<SourceResult> {
+  const { name, url, rowSelector, maxItems } = portal;
+  const result: SourceResult = { name, fetched: 0, added: 0, insertErrors: 0 };
   console.log(`\n[Static] Scraping ${name}...`);
-  let newCount = 0;
 
   try {
-    const { data: html } = await axios.get(url, {
-      timeout: 25000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-      },
-    });
-
+    const html = await fetchHtml(url, 2);
     const $ = cheerio.load(html);
     const rows: string[] = [];
 
     $(rowSelector).each((_i, el) => {
       const text = $(el).text().replace(/\s+/g, ' ').trim();
-      if (text.length > 30) {
-        rows.push(text);
-      }
+      if (text.length > 30) rows.push(text);
     });
 
+    result.fetched = rows.length;
     console.log(`[Static] ${name}: found ${rows.length} items. Processing top ${Math.min(maxItems, rows.length)}...`);
-    const toProcess = rows.slice(0, maxItems);
 
-    for (const row of toProcess) {
+    for (const row of rows.slice(0, maxItems)) {
       if (await isAlreadyIngested(row)) continue;
       const rawText = `Source: ${name}\nURL: ${url}\nContent: ${row}`;
-      const added = await ingestRawText(rawText, name, url);
-      if (added) newCount++;
+      if (await ingestRawText(rawText, name, url)) result.added++;
     }
   } catch (err: any) {
+    result.error = err.message;
     console.error(`[Static] ❌ ${name} failed: ${err.message}`);
   }
 
-  console.log(`[Static] ${name}: +${newCount} new tenders`);
-  return newCount;
-}
-
-// ─── Dynamic scraper (Puppeteer) for GeM pages ──────────────────────────────
-
-async function scrapeGeMWithPuppeteer(browser: any, maxPages = 10): Promise<number> {
-  console.log('\n[Dynamic] Scraping GeM CPPP portal (headless browser)...');
-  let newCount = 0;
-
-  try {
-    const gemPage = await browser.newPage();
-    await gemPage.setViewport({ width: 1366, height: 768 });
-    await gemPage.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await gemPage.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
-    const gemUrls = ['https://gem.gov.in/cppp'];
-    for (let p = 2; p <= maxPages; p++) gemUrls.push(`https://gem.gov.in/cppp/${p}?`);
-
-    let consecutiveFailures = 0;
-    for (let p = 0; p < gemUrls.length; p++) {
-      const pageUrl = gemUrls[p];
-      console.log(`[GeM] Page ${p + 1}/${gemUrls.length}: ${pageUrl}`);
-      try {
-        await gemPage.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 35000 });
-        await gemPage.waitForSelector('table, tr', { timeout: 15000 });
-
-        const rows = await gemPage.evaluate(() => {
-          const trs = Array.from(document.querySelectorAll('table tbody tr'));
-          return trs.map((row: Element) => {
-            const cols = Array.from(row.querySelectorAll('td')) as HTMLElement[];
-            const titleLink = row.querySelector('td:nth-child(4) a') as HTMLAnchorElement | null;
-            const docLink = row.querySelector('td:nth-child(8) a') as HTMLAnchorElement | null;
-            return {
-              closingDate: cols[1]?.innerText?.trim() ?? '',
-              titleAndId: cols[3]?.innerText?.trim() ?? '',
-              organisation: cols[4]?.innerText?.trim() ?? '',
-              targetUrl: titleLink?.href || docLink?.href || 'https://eprocure.gov.in/cppp/tendersearch',
-            };
-          }).filter((r: any) => r.titleAndId.length > 0);
-        });
-
-        console.log(`[GeM] Page ${p + 1}: ${rows.length} bids found`);
-        consecutiveFailures = 0;
-
-        for (const r of rows) {
-          const title = r.titleAndId.split('[')[0].trim().replace(/^title\s*&\s*id:\s*/i, '').trim();
-          if (await isAlreadyIngested(title)) continue;
-          const rawText = `Title & ID: ${r.titleAndId}\nOrganisation: ${r.organisation}\nClosing Date: ${r.closingDate}\nPortal URL: ${r.targetUrl}`;
-          const added = await ingestRawText(rawText, 'GeM CPPP', r.targetUrl);
-          if (added) newCount++;
-        }
-      } catch (pageErr: any) {
-        console.error(`[GeM] Page ${p + 1} error: ${pageErr.message}`);
-        consecutiveFailures++;
-        if (consecutiveFailures >= 2) {
-          console.warn('[GeM] Portal unreachable or geo-blocked on this runner — skipping remaining pages.');
-          break;
-        }
-      }
-    }
-    await gemPage.close().catch(() => {});
-  } catch (err: any) {
-    console.error('[GeM] Headless scraper failed:', err.message);
-  }
-
-  console.log(`[GeM] +${newCount} new tenders`);
-  return newCount;
+  console.log(`[Static] ${name}: +${result.added} new tenders`);
+  return result;
 }
 
 // ─── Main exported function ──────────────────────────────────────────────────
 
-export async function runLiveScraper(): Promise<{ success: boolean; count: number; skipped?: boolean }> {
+export interface ScrapeSummary {
+  success: boolean;
+  count: number;
+  skipped?: boolean;
+  sources: SourceResult[];
+  // True when no listing source returned a single tender row, or inserts
+  // failed outright. Callers use this to fail loudly instead of reporting an
+  // empty run as a success.
+  failed: boolean;
+}
+
+export async function runLiveScraper(options: ScrapeOptions = {}): Promise<ScrapeSummary> {
+  const quick = options.quick === true;
   const lockClient = await pool.connect();
   let holdsLock = false;
 
@@ -206,11 +342,10 @@ export async function runLiveScraper(): Promise<{ success: boolean; count: numbe
   // checked out (only re-attaching it on release), so a client held for a
   // long time — as this one is, for the whole scraper run — has no error
   // listener at all while in use. Without this, the provider dropping the
-  // connection mid-run (e.g. an idle-connection timeout while Puppeteer is
-  // busy) emits an unhandled 'error' event straight from `pg` internals and
-  // crashes the process. Losing the lock connection isn't fatal to the run
-  // itself (advisory locks are released automatically when the underlying
-  // Postgres session ends), so this just logs instead of throwing.
+  // connection mid-run emits an unhandled 'error' event straight from `pg`
+  // internals and crashes the process. Losing the lock connection isn't fatal
+  // to the run itself (advisory locks are released automatically when the
+  // underlying Postgres session ends), so this just logs instead of throwing.
   lockClient.on('error', (err) => {
     console.error('[Scanner] Advisory-lock connection dropped:', err.message);
   });
@@ -219,70 +354,44 @@ export async function runLiveScraper(): Promise<{ success: boolean; count: numbe
     const lockResult = await lockClient.query('SELECT pg_try_advisory_lock($1) AS locked', [SCRAPER_ADVISORY_LOCK]);
     if (!lockResult.rows[0]?.locked) {
       console.log('[Scanner] Another scraper run is already in progress; skipping.');
-      return { success: true, count: 0, skipped: true };
+      return { success: true, count: 0, skipped: true, sources: [], failed: false };
     }
     holdsLock = true;
 
     const geminiStats = getGeminiUsageStats();
-    console.log(`\n🚀 Universal Tender Scraper starting — ${PORTAL_REGISTRY.length} portals`);
+    console.log(`\n🚀 Tender Scraper starting (${quick ? 'quick' : 'full'} run) — ${LISTING_SOURCES.length} listing sources${quick ? '' : ` + ${PORTAL_REGISTRY.length} portals`}`);
     console.log(`🤖 Gemini AI extraction: ${geminiStats.isAvailable ? `enabled (${geminiStats.dailyCalls}/${geminiStats.maxDaily} calls used today)` : 'disabled — using local regex fallback'}`);
 
-    let totalNewCount = 0;
-    let browser: any = null;
+    const sources: SourceResult[] = [];
+    const maxPages = quick ? QUICK_RUN_MAX_PAGES : FULL_RUN_MAX_PAGES;
+    const stopAt = quick ? Date.now() + QUICK_RUN_BUDGET_MS : Number.POSITIVE_INFINITY;
 
-    // ── Launch Puppeteer for JS-rendered sites ─────────────────────────────
-    try {
-      let chromePath = process.env.CHROME_PATH || '';
-      if (!chromePath) {
-        if (process.platform === 'win32') {
-          const winPaths = [
-            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-            `C:\\Users\\${process.env.USERNAME || 'Admin'}\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe`,
-            'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-          ];
-          chromePath = winPaths.find((p) => fs.existsSync(p)) || '';
-        } else {
-          const linuxPaths = ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'];
-          chromePath = linuxPaths.find((p) => fs.existsSync(p)) || '';
-        }
+    for (const source of LISTING_SOURCES) {
+      sources.push(await scrapeListingSource(source, maxPages, stopAt));
+    }
+
+    // The per-portal free-text scrapers are slow and low-yield, so a manual
+    // refresh (which has to answer within the serverless time limit) skips them.
+    if (!quick) {
+      for (const portal of PORTAL_REGISTRY) {
+        sources.push(await scrapeStaticPortal(portal));
+        // Small delay between portals to be polite and avoid rate-limiting
+        await new Promise((resolve) => setTimeout(resolve, 1500));
       }
-
-      if (chromePath) {
-        const puppeteer = await import('puppeteer-core');
-        browser = await puppeteer.launch({
-          executablePath: chromePath,
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
-        });
-        console.log(`[Browser] Launched Chromium at: ${chromePath}`);
-      } else {
-        console.warn('[Browser] No Chromium found — GeM dynamic scraping will be skipped.');
-      }
-    } catch (browserErr: any) {
-      console.warn('[Browser] Could not launch Chromium:', browserErr.message);
     }
 
-    // ── Run GeM with Puppeteer ─────────────────────────────────────────────
-    if (browser) {
-      totalNewCount += await scrapeGeMWithPuppeteer(browser, 10);
-    }
+    const count = sources.reduce((sum, s) => sum + s.added, 0);
+    const listing = sources.slice(0, LISTING_SOURCES.length);
+    const nothingFetched = listing.every((s) => s.fetched === 0);
+    const insertsBroken = count === 0 && sources.some((s) => s.insertErrors > 0);
+    const failed = nothingFetched || insertsBroken;
 
-    // ── Run all static portals with Axios+Cheerio ──────────────────────────
-    const staticPortals = PORTAL_REGISTRY.filter(p => p.method === 'static');
-    for (const portal of staticPortals) {
-      totalNewCount += await scrapeStaticPortal(portal);
-      // Small delay between portals to be polite and avoid rate-limiting
-      await new Promise(resolve => setTimeout(resolve, 1500));
+    console.log('\n── Run summary ──');
+    for (const s of sources) {
+      console.log(`${s.error ? '❌' : '✅'} ${s.name.padEnd(16)} scanned=${s.fetched} added=${s.added} insertErrors=${s.insertErrors}${s.error ? ` — ${s.error}` : ''}`);
     }
-
-    if (browser) {
-      await browser.close().catch(() => {});
-      console.log('[Browser] Chromium session closed.');
-    }
-
-    console.log(`\n🎉 Universal Scraper Complete! Total new tenders ingested: ${totalNewCount}`);
-    return { success: true, count: totalNewCount };
+    console.log(`\n🎉 Scraper complete! Total new tenders ingested: ${count}`);
+    return { success: !failed, count, sources, failed };
 
   } finally {
     if (holdsLock) {

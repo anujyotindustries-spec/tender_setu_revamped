@@ -3,21 +3,28 @@ import { pool } from '../utils/db';
 
 async function main() {
   console.log('--- Starting Standalone Universal Scraper ---');
+  let exitCode = 0;
   try {
     const result = await runLiveScraper();
     console.log(`--- Scraper finished: ${result.count} new tenders added ---`);
+    // A run where no listing source returned any tenders (portal blocked or
+    // layout changed) or every insert failed (e.g. schema out of date) used to
+    // end green and look healthy for weeks. Individual flaky portals still
+    // don't fail the run; only a total outage does.
+    if (result.failed) {
+      console.error('--- Scraper FAILED: no listing source returned tenders, or inserts failed. See the run summary above. ---');
+      exitCode = 1;
+    }
   } catch (err: any) {
     console.error('Scraper encountered an error:', err);
+    exitCode = 1;
   } finally {
-    // A GitHub Actions run should still exit 0 even if closing an
-    // already-broken pool throws, so a flaky network doesn't turn a
-    // "some portals were unreachable" run into a reported CI failure.
     try {
       await pool.end();
     } catch (closeErr: any) {
       console.warn('Pool close warning:', closeErr.message);
     }
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 
